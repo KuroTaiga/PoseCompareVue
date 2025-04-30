@@ -13,22 +13,24 @@ const state = reactive({
   // Model selection
   selectedModels: [],
   filterOptions: ['original', 'butterworth', 'chebyshev', 'bessel'],
+  // Now each model can have multiple selected filters
   modelFilters: {
-    mediapipe: 'original',
-    fourdhumans: 'original',
-    'sapiens_2b': 'original',
-    'sapiens_1b': 'original',
-    'sapiens_0.6b': 'original',
-    'sapiens_0.3b': 'original'
+    mediapipe: ['original'],
+    fourdhumans: ['original'],
+    'sapiens_2b': ['original'],
+    'sapiens_1b': ['original'],
+    'sapiens_0.6b': ['original'],
+    'sapiens_0.3b': ['original']
   },
   filterWindowSize: 5,
   
   // Processing state
   isProcessing: false,
-  jobId: null,
+  activeJobs: {}, // Track jobs by model-filter combination
   
   // Results
-  processResults: []
+  processResults: [],
+  processingTimes: {} // Store processing time for each model-filter combination
 });
 
 // Create actions to modify state
@@ -68,16 +70,60 @@ const actions = {
       
       // Remove from results
       state.processResults = state.processResults.filter(result => result.model !== model);
+      
+      // Remove from active jobs
+      Object.keys(state.activeJobs).forEach(jobKey => {
+        if (jobKey.startsWith(model + '_')) {
+          delete state.activeJobs[jobKey];
+        }
+      });
+      
+      // Remove from processing times
+      Object.keys(state.processingTimes).forEach(timeKey => {
+        if (timeKey.startsWith(model + '_')) {
+          delete state.processingTimes[timeKey];
+        }
+      });
     }
   },
   
-  setModelFilter(model, filter) {
-    state.modelFilters[model] = filter;
+  // Now toggles a filter for a specific model
+  toggleModelFilter(model, filter) {
+    if (!state.modelFilters[model]) {
+      state.modelFilters[model] = [];
+    }
+    
+    const index = state.modelFilters[model].indexOf(filter);
+    if (index === -1) {
+      // Add filter
+      state.modelFilters[model].push(filter);
+    } else {
+      // Remove filter if not the last one
+      if (state.modelFilters[model].length > 1) {
+        state.modelFilters[model].splice(index, 1);
+        
+        // Remove from results
+        const resultKey = `${model}_${filter}`;
+        state.processResults = state.processResults.filter(result => 
+          !(result.model === model && result.filter === filter)
+        );
+        
+        // Remove from active jobs
+        if (state.activeJobs[resultKey]) {
+          delete state.activeJobs[resultKey];
+        }
+        
+        // Remove from processing times
+        if (state.processingTimes[resultKey]) {
+          delete state.processingTimes[resultKey];
+        }
+      }
+    }
   },
   
   resetModelFilters() {
     Object.keys(state.modelFilters).forEach(model => {
-      state.modelFilters[model] = 'original';
+      state.modelFilters[model] = ['original'];
     });
     state.filterWindowSize = 5;
   },
@@ -91,21 +137,37 @@ const actions = {
     state.isProcessing = isProcessing;
   },
   
-  setJobId(id) {
-    state.jobId = id;
+  setJobId(modelFilter, jobId) {
+    state.activeJobs[modelFilter] = {
+      jobId,
+      startTime: Date.now()
+    };
   },
   
   // Results management
-  setResults(results) {
-    state.processResults = results;
+  addResult(result) {
+    state.processResults.push(result);
   },
   
-  updateResultStatus(model, status, url = null) {
-    const result = state.processResults.find(r => r.model === model);
+  updateResultStatus(model, filter, status, url = null) {
+    const resultKey = `${model}_${filter}`;
+    const result = state.processResults.find(r => 
+      r.model === model && r.filter === filter
+    );
+    
     if (result) {
       result.status = status;
       if (url) {
         result.url = url;
+      }
+      
+      // Calculate processing time when completed
+      if (status === 'completed' && state.activeJobs[resultKey]) {
+        const startTime = state.activeJobs[resultKey].startTime;
+        const endTime = Date.now();
+        const processingTime = (endTime - startTime) / 1000; // in seconds
+        state.processingTimes[resultKey] = processingTime;
+        result.processingTime = processingTime;
       }
     }
   },
@@ -123,7 +185,8 @@ const actions = {
     state.processResults = [];
     
     // Reset processing state
-    state.jobId = null;
+    state.activeJobs = {};
+    state.processingTimes = {};
     state.isProcessing = false;
   }
 };
@@ -181,16 +244,45 @@ const api = {
     try {
       actions.setProcessing(true);
       
-      // Prepare result placeholders
-      const results = state.selectedModels.map(model => ({
-        model: model,
-        filter: state.modelFilters[model],
-        status: 'pending',
-        url: null
-      }));
+      // Start individual jobs for each model-filter combination
+      const jobPromises = [];
       
-      actions.setResults(results);
+      for (const model of state.selectedModels) {
+        for (const filter of state.modelFilters[model]) {
+          // Create a unique job for each model-filter combination
+          const resultKey = `${model}_${filter}`;
+          
+          // Add result placeholder first
+          const resultPlaceholder = {
+            model: model,
+            filter: filter,
+            status: 'pending',
+            url: null,
+            processingTime: null
+          };
+          
+          actions.addResult(resultPlaceholder);
+          
+          // Start this specific job
+          const jobPromise = api.startSingleJob(model, filter, resultKey);
+          jobPromises.push(jobPromise);
+        }
+      }
       
+      // Wait for all jobs to be initiated
+      await Promise.all(jobPromises);
+      
+      // Return success if any jobs were started
+      return Object.keys(state.activeJobs).length > 0;
+    } catch (error) {
+      console.error('Error starting processing:', error);
+      actions.setProcessing(false);
+      return null;
+    }
+  },
+  
+  async startSingleJob(model, filter, resultKey) {
+    try {
       const response = await fetch('/api/process', {
         method: 'POST',
         headers: {
@@ -198,8 +290,8 @@ const api = {
         },
         body: JSON.stringify({
           upload_id: state.uploadId,
-          models: state.selectedModels,
-          noise_filter: 'original', // Default filter
+          models: [model],
+          noise_filter: filter,
           filter_window: state.filterWindowSize
         })
       });
@@ -207,78 +299,100 @@ const api = {
       const data = await response.json();
       
       if (data.status === 'success') {
-        actions.setJobId(data.job_id);
+        actions.setJobId(resultKey, data.job_id);
+        
+        // Start polling for this specific job
+        api.pollJobStatus(resultKey, model, filter, data.job_id);
+        
         return data.job_id;
       } else {
-        // Update all results to failed
-        state.selectedModels.forEach(model => {
-          actions.updateResultStatus(model, 'failed');
-        });
-        
-        actions.setProcessing(false);
+        // Update result to failed
+        actions.updateResultStatus(model, filter, 'failed');
         return null;
       }
     } catch (error) {
-      console.error('Error starting processing:', error);
-      
-      // Update all results to failed
-      state.selectedModels.forEach(model => {
-        actions.updateResultStatus(model, 'failed');
-      });
-      
-      actions.setProcessing(false);
+      console.error(`Error starting job for ${resultKey}:`, error);
+      actions.updateResultStatus(model, filter, 'failed');
       return null;
     }
   },
   
-  async checkJobStatus() {
-    if (!state.jobId) return;
+  async pollJobStatus(resultKey, model, filter, jobId) {
+    // Set up polling interval
+    const pollInterval = setInterval(async () => {
+      try {
+        const response = await fetch(`/api/jobs/${jobId}`);
+        const data = await response.json();
+        
+        if (data.status === 'success') {
+          const job = data.job;
+          
+          // Check if job is completed
+          if (job.status === 'completed') {
+            console.log(`Job completed for ${resultKey}:`, job);
+            
+            // Update result
+            if (data.results && data.results[model]) {
+              actions.updateResultStatus(model, filter, 'completed', data.results[model].video);
+            } else {
+              actions.updateResultStatus(model, filter, 'failed');
+            }
+            
+            // Stop polling
+            clearInterval(pollInterval);
+            
+            // Check if all jobs are completed
+            checkAllJobsCompleted();
+          } else if (job.status === 'failed') {
+            console.error(`Job failed for ${resultKey}:`, job);
+            
+            // Update result
+            actions.updateResultStatus(model, filter, 'failed');
+            
+            // Stop polling
+            clearInterval(pollInterval);
+            
+            // Check if all jobs are completed
+            checkAllJobsCompleted();
+          }
+        } else {
+          console.error(`Failed to get status for ${resultKey}:`, data.message);
+          
+          // Stop polling after too many failures
+          clearInterval(pollInterval);
+          actions.updateResultStatus(model, filter, 'failed');
+          
+          // Check if all jobs are completed
+          checkAllJobsCompleted();
+        }
+      } catch (error) {
+        console.error(`Error polling job ${jobId} for ${resultKey}:`, error);
+      }
+    }, 2000); // Poll every 2 seconds
+    
+    // Function to check if all jobs are completed
+    function checkAllJobsCompleted() {
+      const allCompleted = state.processResults.every(result => 
+        result.status === 'completed' || result.status === 'failed'
+      );
+      
+      if (allCompleted) {
+        actions.setProcessing(false);
+      }
+    }
+  },
+  
+  async checkJobStatus(jobId) {
+    if (!jobId) return;
     
     try {
-      const response = await fetch(`/api/jobs/${state.jobId}`);
+      const response = await fetch(`/api/jobs/${jobId}`);
       const data = await response.json();
       
-      if (data.status === 'success') {
-        const job = data.job;
-        
-        // Check if job is completed
-        if (job.status === 'completed') {
-          console.log('Job completed:', job);
-          
-          // Update results
-          state.processResults.forEach(result => {
-            const model = result.model;
-            
-            if (data.results && data.results[model]) {
-              actions.updateResultStatus(model, 'completed', data.results[model].video);
-            } else {
-              actions.updateResultStatus(model, 'failed');
-            }
-          });
-          
-          actions.setProcessing(false);
-          return true;
-        } else if (job.status === 'failed') {
-          console.error('Job failed:', job);
-          
-          // Update all results to failed
-          state.processResults.forEach(result => {
-            actions.updateResultStatus(result.model, 'failed');
-          });
-          
-          actions.setProcessing(false);
-          return false;
-        }
-        
-        // Job still processing
-        return null;
-      } else {
-        console.error('Failed to get job status:', data.message);
-        return false;
-      }
+      return data;
     } catch (error) {
       console.error('Error checking job status:', error);
-      return false;
+      return null;
     }
   }
 };
@@ -293,8 +407,11 @@ const getters = {
   modelFilters: computed(() => state.modelFilters),
   filterWindowSize: computed(() => state.filterWindowSize),
   processResults: computed(() => state.processResults),
+  processingTimes: computed(() => state.processingTimes),
   hasResults: computed(() => state.processResults.length > 0),
-  canProcess: computed(() => state.videoFile && state.selectedModels.length > 0)
+  canProcess: computed(() => state.videoFile && state.selectedModels.length > 0 && 
+    state.selectedModels.every(model => state.modelFilters[model] && state.modelFilters[model].length > 0)
+  )
 };
 
 // Create a store factory

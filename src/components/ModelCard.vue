@@ -14,13 +14,14 @@
     
     <div class="model-body" v-if="isSelected">
       <h4>Filter Options</h4>
+      <p class="helper-text">Select one or more filters to apply</p>
       <div class="filter-options">
         <button 
           v-for="filter in store.filterOptions.value" 
           :key="filter"
           class="filter-btn" 
-          :class="{ 'selected': store.modelFilters.value[modelId] === filter }"
-          @click="setFilter(filter)"
+          :class="{ 'selected': isFilterSelected(filter) }"
+          @click="toggleFilter(filter)"
           :disabled="disabled"
         >
           {{ formatFilterName(filter) }}
@@ -74,14 +75,19 @@ export default {
       return store.selectedModels.value.includes(props.modelId);
     });
     
+    const isFilterSelected = (filter) => {
+      return store.modelFilters.value[props.modelId] && 
+        store.modelFilters.value[props.modelId].includes(filter);
+    };
+    
     const toggleModel = () => {
       if (props.disabled) return;
       store.toggleModel(props.modelId);
     };
     
-    const setFilter = (filter) => {
+    const toggleFilter = (filter) => {
       if (props.disabled) return;
-      store.setModelFilter(props.modelId, filter);
+      store.toggleModelFilter(props.modelId, filter);
     };
     
     const updateFilterWindow = (event) => {
@@ -96,8 +102,9 @@ export default {
     return {
       store,
       isSelected,
+      isFilterSelected,
       toggleModel,
-      setFilter,
+      toggleFilter,
       updateFilterWindow,
       formatFilterName
     };
@@ -168,9 +175,15 @@ export default {
 
 .model-body h4 {
   font-size: 14px;
-  margin-bottom: 12px;
+  margin-bottom: 4px;
   font-weight: 500;
   color: var(--text-secondary);
+}
+
+.helper-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
 }
 
 .filter-options {
